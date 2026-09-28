@@ -37,7 +37,7 @@ WebIO is engineered as a specialized core engine for projects like `[Fluxor](htt
 
 - **Safe-Turbo Bridge:** While WebIO uses OS threads for isolation, a specialized **`block_on`** executor allows the use of **`async`** logic (like calling an external API or database) inside threads without the bloat of a massive dependency tree.
 
-- **Zero-RAM Big Data:** Raw **`TcpStream`** access enables moving 100GB+ datasets directly from the socket to disk in 64KB chunks. This bypasses the 10MB RAM safety guard, ensuring the engine remains stable under massive data ingestion.
+- **Zero-RAM Big Data:** Request bodies up to the configurable limit (`set_max_body_size`, 10 MiB by default) are read into memory; larger requests are rejected with `413`. Static files of 500 KB and above are streamed from disk in 64KB chunks instead of being loaded into RAM.
 
 ## 1-6. Performance Architecture
 

@@ -30,7 +30,7 @@ WebIO utilizes raw OS Threads for true kernel-level isolation. Whether serving a
 
 - **Go-Inspired Concurrency:** A unique OS thread per connection ensures pre-emptive multitasking. A heavy mathematical calculation on one thread never "freezes" the server for others.
 - **Safe-Turbo Bridge:** A specialized **`block_on`** executor with a 150k-cycle spin-loop catches I/O states in nanoseconds, bypassing OS scheduler jitter for ultra-low latency.
-- **Zero-RAM Big Data**: Raw TcpStream access enables moving 100GB+ datasets in 64KB chunks, bypassing the 10MB RAM safety guard.
+- **Zero-RAM Big Data**: Request bodies up to a configurable limit (`set_max_body_size`, 10 MiB default) are buffered; larger ones get `413`. Static files ≥ 500 KB stream from disk in 64KB chunks.
 
 ## Production Ready: v1.0.0 Stable
 **WebIO is now a Stable Production Engine, moving beyond its initial research and development phase.**

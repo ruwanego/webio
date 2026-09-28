@@ -28,25 +28,66 @@ use crate::crypto::{Sha1, base64_encode};
 /// hidden within deep subdirectories. By traversing the filesystem recursively, 
 /// WebIO provides a flexible "Smart Static" delivery system that reduces 
 /// manual route configuration for complex frontend directory structures.
+///
+/// The search is bounded: it descends at most [`MAX_SEARCH_DEPTH`] levels and
+/// never follows symbolic links to directories, so a symlink loop or a very
+/// deep tree cannot exhaust the stack.
 pub fn find_file_recursive(dir: &Path, filename: &str) -> Option<PathBuf> {
+    find_file_bounded(dir, filename, MAX_SEARCH_DEPTH)
+}
+
+/// Maximum directory depth searched by [`find_file_recursive`].
+pub const MAX_SEARCH_DEPTH: usize = 8;
+
+fn find_file_bounded(dir: &Path, filename: &str, depth_left: usize) -> Option<PathBuf> {
     if !dir.is_dir() { return None; }
-    
+
     // Check current scope: Priority 1
     let current_check = dir.join(filename);
-    if current_check.exists() { return Some(current_check); }
+    if current_check.is_file() { return Some(current_check); }
+    if depth_left == 0 { return None; }
 
-    // Recursive Descent: Scan subdirectories
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = find_file_recursive(&path, filename) {
-                    return Some(found);
-                }
+    // Recursive Descent: Scan real (non-symlink) subdirectories
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_real_dir {
+            if let Some(found) = find_file_bounded(&entry.path(), filename, depth_left - 1) {
+                return Some(found);
             }
         }
     }
     None
+}
+
+/// Decodes `%XX` escapes in `input`. When `plus_as_space` is true, `+` is
+/// decoded as a space (HTML form encoding). Invalid escapes are kept verbatim;
+/// invalid UTF-8 is replaced with U+FFFD.
+pub fn percent_decode(input: &str, plus_as_space: bool) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    (Some(h), Some(l)) => { out.push(h << 4 | l); i += 3; }
+                    _ => { out.push(b'%'); i += 1; }
+                }
+            }
+            b'+' if plus_as_space => { out.push(b' '); i += 1; }
+            b => { out.push(b); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Generates the cryptographic `Sec-WebSocket-Accept` signature (RFC 6455).
