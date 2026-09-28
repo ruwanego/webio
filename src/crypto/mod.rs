@@ -37,6 +37,10 @@ pub struct Sha1 {
     count: u64,
 }
 
+impl Default for Sha1 {
+    fn default() -> Self { Self::new() }
+}
+
 impl Sha1 {
     /// Initializes the SHA-1 state with the standard cryptographic constants.
     pub fn new() -> Self {
@@ -66,8 +70,8 @@ impl Sha1 {
         // Core transformation loop: process 512-bit (64-byte) blocks
         for chunk in self.buffer.chunks_exact(64) {
             let mut w = [0u32; 80];
-            for i in 0..16 {
-                w[i] = u32::from_be_bytes([chunk[i*4], chunk[i*4+1], chunk[i*4+2], chunk[i*4+3]]);
+            for (i, word) in chunk.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
             }
             // Expand 16 words into 80 words
             for i in 16..80 {
@@ -75,14 +79,14 @@ impl Sha1 {
             }
             let [mut a, mut b, mut c, mut d, mut e] = self.state;
             // 80 Rounds of hashing transformation
-            for i in 0..80 {
+            for (i, &wi) in w.iter().enumerate() {
                 let (f, k) = match i {
                     0..=19 => ((b & c) | (!b & d), 0x5A827999),
                     20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
                     40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
                     _ => (b ^ c ^ d, 0xCA62C1D6),
                 };
-                let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+                let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
                 e = d; d = c; c = b.rotate_left(30); b = a; a = temp;
             }
             // Accumulate the transformation back into the internal state
@@ -118,7 +122,7 @@ pub fn base64_encode(input: &[u8]) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     // Memory Optimization: Pre-allocate the exact required capacity
     // to prevent redundant heap reallocations during the encoding process.
-    let mut result = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         // Concatenate 8-bit bytes into a 32-bit register for bit-shifting.
         let b = match chunk.len() {
@@ -145,9 +149,20 @@ pub fn base64_encode(input: &[u8]) -> String {
 /// parsing into a dedicated structure, WebIO maintains a clean separation between 
 /// standard HTTP request-response cycles and persistent, full-duplex streams.
 pub struct WSFrame {
+    /// `true` if this is the final fragment of a message.
+    pub fin: bool,
+    /// Frame opcode: `0x0` continuation, `0x1` text, `0x2` binary,
+    /// `0x8` close, `0x9` ping, `0xA` pong.
+    pub opcode: u8,
     /// The unmasked binary payload extracted from the WebSocket frame.
     pub payload: Vec<u8>,
 }
+
+/// Default upper bound on a single WebSocket frame payload accepted by
+/// [`WSFrame::read`] (16 MiB). Larger frames are rejected before any
+/// allocation, so a client cannot force the server to allocate by declaring
+/// a huge 64-bit length.
+pub const WS_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 impl WSFrame {
     /// Ingests and decodes a raw WebSocket frame directly from the network stream.
@@ -165,43 +180,77 @@ impl WSFrame {
     ///   being passed to the application layer.
     /// * **I/O Efficiency:** Utilizes `read_exact` to ensure frame integrity, 
     ///   preventing partial reads that could corrupt high-precision data streams.
+    ///
+    /// Frames larger than [`WS_MAX_FRAME_SIZE`] and unmasked client frames
+    /// (forbidden by RFC 6455 §5.1) are rejected with `ErrorKind::InvalidData`.
     pub fn read(stream: &mut TcpStream) -> std::io::Result<Self> {
+        Self::read_with_limit(stream, WS_MAX_FRAME_SIZE)
+    }
+
+    /// Same as [`WSFrame::read`] with a caller-chosen payload size limit.
+    pub fn read_with_limit(stream: &mut TcpStream, max_payload: usize) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
         let mut head = [0u8; 2];
         stream.read_exact(&mut head)?;
+        let fin = head[0] & 0x80 != 0;
+        let opcode = head[0] & 0x0F;
 
         // The second byte contains the Mask bit (MSB) and Payload Length (7 bits)
         let is_masked = (head[1] & 0x80) != 0;
-        let mut len = (head[1] & 0x7F) as usize;
+        let mut len = (head[1] & 0x7F) as u64;
 
         // Dynamic Length Decoding: Handles extended 16-bit or 64-bit length fields
         if len == 126 {
             let mut extended_len = [0u8; 2];
             stream.read_exact(&mut extended_len)?;
-            len = u16::from_be_bytes(extended_len) as usize;
+            len = u16::from_be_bytes(extended_len) as u64;
         } else if len == 127 {
             let mut extended_len = [0u8; 8];
             stream.read_exact(&mut extended_len)?;
-            len = u64::from_be_bytes(extended_len) as usize;
+            len = u64::from_be_bytes(extended_len);
         }
 
-        // Memory Allocation: Pre-allocates the payload buffer based on the decoded length
+        if !is_masked {
+            return Err(Error::new(ErrorKind::InvalidData, "unmasked client WebSocket frame"));
+        }
+        if len > max_payload as u64 {
+            return Err(Error::new(ErrorKind::InvalidData, "WebSocket frame exceeds size limit"));
+        }
+        let len = len as usize;
+
+        let mut mask = [0u8; 4];
+        stream.read_exact(&mut mask)?;
+        // Allocation happens only after the length has been bounded above.
         let mut payload = vec![0u8; len];
-
-        if is_masked {
-            let mut mask = [0u8; 4];
-            stream.read_exact(&mut mask)?;
-            stream.read_exact(&mut payload)?;
-            // Cryptographic XOR Unmasking (RFC 6455 Section 5.3)
-            // Essential for maintaining protocol safety and data integrity.
-            for i in 0..len {
-                payload[i] ^= mask[i % 4];
-            }
-        } else {
-            // Unmasked frames from clients are technically a protocol violation,
-            // but the logic provides a fallback for non-compliant implementations.
-            stream.read_exact(&mut payload)?;
+        stream.read_exact(&mut payload)?;
+        // Cryptographic XOR Unmasking (RFC 6455 Section 5.3)
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
         }
 
-        Ok(WSFrame { payload })
+        Ok(WSFrame { fin, opcode, payload })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha1_and_base64_known_vectors() {
+        let mut h = Sha1::new();
+        h.update(b"abc");
+        assert_eq!(base64_encode(&h.finalize()), "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=");
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn websocket_accept_rfc6455_example() {
+        assert_eq!(
+            crate::utils::derive_websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 }
