@@ -45,42 +45,40 @@ fn main() {
 
 Strict memory management prevents system exhaustion during high-concurrency or malicious "Big Data" uploads.
 
-**Pre-emptive Rejection (The 10MB Threshold)**
+**Pre-emptive Rejection (Body Size Limit)**
 
-WebIO inspects the `Content-Length` header before allocating memory. If a payload exceeds the **10MB safety limit**, the connection is terminated immediately with a `403 Forbidden` response.
+WebIO inspects the `Content-Length` header before reading or allocating the body. If it exceeds the limit (**10 MiB** by default), the engine answers `413 Content Too Large` and the handler never runs. Requests using `Transfer-Encoding` are answered with `501 Not Implemented`.
+
+**Limits and Timeouts**
 
 ```rust,no_run
 use webio::*;
+use std::time::Duration;
 
 fn main() {
     let mut app = WebIo::new();
 
-    app.route(POST, "/secure-upload", |req, _params| async move {
-        // --- 1. DEFINE THRESHOLD ---
-        let max_body_size = 10 * 1024 * 1024; // 10MB Threshold
-
-        // --- 2. EXTRACT METADATA ---
-        let content_length = req.headers.get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-
-        // --- 3. ENFORCE GUARD ---
-        if content_length > max_body_size {
-            return Reply::new(StatusCode::Forbidden)
-                .body("Payload Too Large (Max 10MB)");
-        }
-
-        Reply::new(StatusCode::Ok).body("Data safe for heap allocation")
+    app.route(POST, "/upload", |req, _params| async move {
+        // The whole body (up to the limit) is already in memory.
+        Reply::new(StatusCode::Ok).body(format!("received {} bytes", req.body_bytes.len()))
     });
 
-    app.run("0.0.0.0", "8080");
+    app.set_max_body_size(50 * 1024 * 1024)   // 413 above 50 MiB (default 10 MiB)
+       .set_max_connections(1000)             // 503 above 1000 concurrent connections (default 2000)
+       .set_timeouts(
+           Duration::from_secs(30),           // 408 if a request takes longer to arrive
+           Duration::from_secs(30),           // per-write timeout while sending a reply
+       )
+       .run("0.0.0.0", "8080");
 }
 ```
 
 **Protocol Significance**
 
-- **Pre-emptive Rejection:** The connection is evaluated **before** the application attempts to buffer the body, stopping DoS attacks at the header level.
-- **Zero-Waste Policy:** If `content_length` exceeds `max_body_size`, the engine returns a 403 Forbidden immediately, preserving CPU and RAM for other concurrent threads.
+- **Pre-emptive Rejection:** The connection is evaluated **before** the body is buffered, stopping oversized uploads at the header level.
+- **Bounded Heads:** The request line plus headers may not exceed 16 KiB or 100 fields (`431`).
+- **Slow-Client Protection:** Each request must fully arrive within the read timeout, so a client that sends one byte at a time cannot hold a worker thread (`408`).
+- **Binary Bodies:** `req.body_bytes` holds the exact bytes received; `req.body` is the same data decoded as UTF-8.
 
 ## 9-3. Thread Isolation Security
 
