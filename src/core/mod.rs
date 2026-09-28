@@ -14,7 +14,7 @@
 //!   to ensure rapid compilation and a transparent security audit trail.
 
 use std::collections::HashMap;
-use std::io::{Read, Write, BufWriter};
+use std::io::{Write, BufWriter};
 use std::net::TcpStream;
 use std::pin::{Pin, pin};
 use std::future::Future;
@@ -109,8 +109,12 @@ pub struct Req {
     pub method: String,
     /// Full request path (e.g., "/user/123?query=true").
     pub path: String,
-    /// Parsed request body (limited to 10MB to prevent RAM exhaustion).
+    /// Request body decoded as UTF-8 (invalid sequences become U+FFFD).
+    /// Limited by [`WebIo::set_max_body_size`](crate::WebIo::set_max_body_size)
+    /// (10 MiB by default). Use [`Req::body_bytes`] for binary payloads.
     pub body: String,
+    /// The exact request body bytes, as received.
+    pub body_bytes: Vec<u8>,
     /// Metadata headers mapped from the raw HTTP text.
     pub headers: HashMap<String, String>,
     /// Raw socket access for Zero-RAM Big Data streaming.
@@ -127,43 +131,34 @@ impl Req {
     /// HTML POST forms or serialized metadata strings. By utilizing an internal 
     /// parsing logic with `replace` for standard '+' space decoding, it maintains 
     /// high efficiency for typical metadata ingestion tasks.
+    ///
+    /// Keys and values are percent-decoded and `+` is decoded as a space.
     pub fn form(&self) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        for pair in self.body.split('&') {
-            let mut kv = pair.split('=');
-            if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
-                // Space decoding per HTTP standards
-                let decoded_v = v.replace('+', " "); 
-                map.insert(k.to_string(), decoded_v);
-            }
-        }
-        map
+        parse_urlencoded(&self.body)
     }
 
-    /// Performs Zero-RAM Big Data ingestion by streaming the raw socket data directly 
-    /// to the filesystem.
-    /// 
-    /// This method is the primary mechanism for handling massive datasets (e.g., multi-gigabyte 
-    /// CSVs, models, or video files) without triggering the 10MB RAM safety guard. 
-    /// Utilizing a high-throughput 64KB buffer and a `BufWriter`, it ensures maximum 
-    /// I/O performance while maintaining a constant, negligible memory footprint. 
-    /// 
-    /// ### Reliability:
-    /// It returns the total number of bytes successfully written, providing 
-    /// a precise integrity check for high-concurrency data science pipelines.
+    /// Parses the query string of [`Req::path`] (the part after `?`) the same
+    /// way [`Req::form`] parses a form body.
+    pub fn query(&self) -> HashMap<String, String> {
+        match self.path.split_once('?') {
+            Some((_, q)) => parse_urlencoded(q.split('#').next().unwrap_or("")),
+            None => HashMap::new(),
+        }
+    }
+
+    /// Writes the request body to a file and returns the number of bytes written.
+    ///
+    /// The engine has already read the complete `Content-Length` body into
+    /// [`Req::body_bytes`] before the handler runs (HTTP/1.1 request bodies
+    /// without `Content-Length` are empty or rejected), so this writes those
+    /// bytes to `path`. Errors are returned instead of silently truncating
+    /// the file.
     pub fn save_to_file(&mut self, path: &str) -> std::io::Result<u64> {
         let file = std::fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
-        let mut buffer = [0; 65536]; // Optimized 64KB fragment
-        let mut total = 0;
-
-        while let Ok(n) = self.stream.read(&mut buffer) {
-            if n == 0 { break; }
-            writer.write_all(&buffer[..n])?;
-            total += n as u64;
-        }
+        writer.write_all(&self.body_bytes)?;
         writer.flush()?;
-        Ok(total)
+        Ok(self.body_bytes.len() as u64)
     }
 
     /// Upgrades the active HTTP connection to a persistent WebSocket.
@@ -178,8 +173,20 @@ impl Req {
     /// Upon a successful handshake (101 Switching Protocols), the handler 
     /// gains exclusive ownership of the socket, effectively isolating the 
     /// WebSocket thread from the general HTTP routing engine.
+    ///
+    /// Returns `None` unless the request is a valid RFC 6455 upgrade
+    /// (`Upgrade: websocket`, `Sec-WebSocket-Version: 13`, a key present) and
+    /// the handshake was written successfully. After a successful upgrade the
+    /// handler should return a reply with [`StatusCode::SwitchingProtocols`];
+    /// the engine then writes nothing further and leaves the socket open.
     pub fn upgrade_websocket(&self) -> Option<TcpStream> {
-        let key = self.headers.get("sec-websocket-key")?;
+        let is_ws = self.headers.get("upgrade")
+            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("websocket")))
+            .unwrap_or(false);
+        let version_ok = self.headers.get("sec-websocket-version").map(|v| v.trim() == "13").unwrap_or(false);
+        if !is_ws || !version_ok { return None; }
+        let key = self.headers.get("sec-websocket-key")?.trim();
+        if key.is_empty() { return None; }
         
         // RFC 6455 Cryptographic Handshake Logic
         let accept_key = crate::utils::derive_websocket_accept(key); 
@@ -193,12 +200,25 @@ impl Req {
         );
 
         let mut s = self.stream.try_clone().ok()?;
-        let _ = s.write_all(response.as_bytes());
+        s.write_all(response.as_bytes()).ok()?;
         Some(s)
     }
 }
 
-//// A collection of dynamic URL segments extracted from the request path.
+/// Parses `a=1&b=two+words&c=%2F` into a map. Later duplicates win.
+fn parse_urlencoded(input: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in input.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        map.insert(
+            crate::utils::percent_decode(k, true),
+            crate::utils::percent_decode(v, true),
+        );
+    }
+    map
+}
+
+/// A collection of dynamic URL segments extracted from the request path.
 /// 
 /// If a route is defined as `/user/<id>`, and the request is `/user/42`, 
 /// the Params will contain `{"id": "42"}`.
